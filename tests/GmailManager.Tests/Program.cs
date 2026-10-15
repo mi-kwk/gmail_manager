@@ -66,6 +66,10 @@ store.Put("operation",interrupted.Id,interrupted);
 var restart=new Store(root);
 Check(restart.Get<Backup>("backup",m2.Key) is { Protected:true,State:"失敗" },"interrupted backup stays protected after restart");
 Check(restart.Get<Operation>("operation","interrupted")!.Items[0].State=="要確認","interrupted in-flight request is not silently retried");
+var liveContent=await MailEngine.ReadMessageAsync(await gateway.RawAsync(m1,CancellationToken.None));
+Check(liveContent.Body.Contains("offline body") && liveContent.Attachments.Count==1,"ordinary unregistered messages can be parsed for preview");
+var htmlContent=await MailEngine.ReadMessageAsync(Encoding.UTF8.GetBytes("From: sender@example.com\r\nContent-Type: text/html; charset=utf-8\r\n\r\n<p>Preview &amp; body</p><script>hidden_script()</script>"));
+Check(htmlContent.Body.Contains("Preview & body") && !htmlContent.Body.Contains("hidden_script"),"HTML preview is decoded as inert text without scripts");
 Console.WriteLine($"{checks} checks passed. Test data: {root}");
 
 sealed class FakeGateway : IMailGateway

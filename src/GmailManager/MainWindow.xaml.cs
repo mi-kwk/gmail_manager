@@ -14,6 +14,10 @@ public partial class MainWindow : Window
     private readonly MailEngine engine;
     private CancellationTokenSource? work;
     private bool refreshing;
+    private string? selectedSender;
+    private readonly Dictionary<string,string> accountNames=new();
+    private CancellationTokenSource? previewRequest;
+    private (string Body, List<(string Name, byte[] Data)> Attachments)? previewContent;
     public MainWindow(string? dataRoot = null)
     {
         InitializeComponent();
@@ -24,8 +28,31 @@ public partial class MainWindow : Window
         Refresh();
         Closing += (_,e) => { if(work is not null) { e.Cancel = true; MessageBox.Show("処理中です。キャンセル後、結果を確認して終了してください。"); } else gateway.Dispose(); };
     }
-    private string AccountName(string id) => store.Get<Account>("account",id)?.Caption ?? id;
-    private record MailRow(Mail Value, string 元アカウント, string 送信元, string 件名, string 受信日時, string ラベル, string 削除保護);
+    private string AccountName(string id)
+    {
+        if(accountNames.TryGetValue(id,out var cached)) return cached;
+        var accounts=store.All<Account>("account");
+        var account=accounts.FirstOrDefault(a=>a.Id==id);
+        if(account is null) return "未接続のアカウント";
+        string Name(Account a) => a.DisplayName.Contains('@') ? "アカウント" : a.DisplayName;
+        var duplicates=accounts.Where(a=>Name(a)==Name(account)).ToList();
+        var result=duplicates.Count>1 ? $"{Name(account)} ({duplicates.FindIndex(a=>a.Id==id)+1})" : Name(account);
+        accountNames[id]=result; return result;
+    }
+    private sealed class MailRow : System.ComponentModel.INotifyPropertyChanged
+    {
+        public Mail Value { get; }
+        public string 元アカウント { get; }
+        public string 送信元 => Value.Sender;
+        public string 件名 => Value.Subject;
+        public string 受信日時 => Value.Date.LocalDateTime.ToString("yyyy/MM/dd HH:mm");
+        public string 削除保護 { get; }
+        private bool check;
+        public bool IsChecked { get=>check; set { check=value; PropertyChanged?.Invoke(this,new(nameof(IsChecked))); } }
+        public event System.ComponentModel.PropertyChangedEventHandler? PropertyChanged;
+        public MailRow(Mail mail,string account,bool protect) { Value=mail; 元アカウント=account; 削除保護=protect?"保護中":""; }
+    }
+    private record SenderChoice(string Address,int Count) { public string CountText=>$"{Count:N0} 件"; }
     private record BackupRow(Backup Value, string 元アカウント, string 送信元, string 件名, string 保存状態, string 保護, string 保存先, string エラー);
     private record SenderRow(string 送信元, int 全体件数, string アカウント別件数);
     private record AccountRow(Account Value, string 表示名, string メールアドレス, string 内部識別子);
@@ -45,14 +72,27 @@ public partial class MainWindow : Window
         refreshing = true;
         try
         {
+            accountNames.Clear();
             var accounts = store.All<Account>("account");
             var chosen = (AccountFilter.SelectedItem as Account)?.Id ?? "";
-            AccountFilter.ItemsSource = new[]{ new Account("","","全アカウント") }.Concat(accounts).ToList();
+            AccountFilter.ItemsSource = new[]{ new Account("","","全アカウント") }.Concat(accounts.Select(a=>a with { DisplayName=AccountName(a.Id),Email="" })).ToList();
             AccountFilter.SelectedItem = ((IEnumerable<Account>)AccountFilter.ItemsSource).FirstOrDefault(a => a.Id == chosen);
             var mails = store.All<Mail>("mail").Where(m => m.Eligible).ToList();
-            Bind(MailGrid,mails.Where(m => (chosen == "" || m.AccountId == chosen) &&
-                Contains(m.Subject+" "+m.Sender+" "+AccountName(m.AccountId),MailSearch.Text))
-                .OrderByDescending(m => m.Date).Select(m => new MailRow(m,AccountName(m.AccountId),m.Sender,m.Subject,m.Date.LocalDateTime.ToString("yyyy/MM/dd HH:mm"),string.Join(", ",m.Labels),engine.IsProtected(m)?"保護中":"")).ToList());
+            var protectedKeys=store.All<Backup>("backup").Where(b=>b.Protected).Select(b=>b.Mail.Key).ToHashSet();
+            var scoped=mails.Where(m=>chosen=="" || m.AccountId==chosen).ToList();
+            var senderChoices=scoped.GroupBy(m=>m.Sender,StringComparer.Ordinal)
+                .Where(g=>Contains(g.Key,SenderSearch.Text)).OrderByDescending(g=>g.Count())
+                .Select(g=>new SenderChoice(g.Key,g.Count())).ToList();
+            SenderList.ItemsSource=senderChoices;
+            SenderList.SelectedItem=senderChoices.FirstOrDefault(s=>s.Address==selectedSender);
+            var filtered=scoped.Where(m=>(selectedSender is null || m.Sender==selectedSender) &&
+                Contains(m.Subject+" "+m.Sender+" "+AccountName(m.AccountId),MailSearch.Text)).OrderByDescending(m=>m.Date).ToList();
+            Bind(MailGrid,filtered.Select(m=>new MailRow(m,AccountName(m.AccountId),protectedKeys.Contains(m.Key))).ToList());
+            FilterSummary.Text=$"{(selectedSender??"すべての送信元")}  ·  {filtered.Count:N0} 件";
+            previewRequest?.Cancel(); previewContent=null;
+            PreviewSubject.Text="メールを選択してください"; PreviewMeta.Text="";
+            PreviewBody.Text="本文はここに表示されます。"; PreviewAttachments.Children.Clear(); OpenPreviewButton.IsEnabled=false;
+            UpdateCheckedCount();
             Bind(SenderGrid,mails.GroupBy(m=>m.Sender,StringComparer.Ordinal).OrderByDescending(g=>g.Count())
                 .Select(g=>new SenderRow(g.Key,g.Count(),string.Join(" / ",g.GroupBy(m=>m.AccountId).Select(a=>$"{AccountName(a.Key)}: {a.Count()}")))).ToList());
             BackupRow Row(Backup b) => new(b,AccountName(b.Mail.AccountId),b.Mail.Sender,b.Mail.Subject,b.State,b.Protected?"保護中":"解除済み",b.Path??"",b.Error??"");
@@ -79,7 +119,7 @@ public partial class MainWindow : Window
     {
         foreach(var account in store.All<Account>("account"))
         {
-            Status.Text = $"{account.Caption} の全期間メールを取得中…";
+            Status.Text = $"{AccountName(account.Id)} の全期間メールを取得中…";
             var mails = await gateway.ListAsync(account,ct);
             store.ReplaceMail(account,mails);
             Refresh();
@@ -102,10 +142,11 @@ public partial class MainWindow : Window
     private async void Sync_Click(object s,RoutedEventArgs e) => await Run(Sync);
     private void Cancel_Click(object s,RoutedEventArgs e) { work?.Cancel(); Status.Text="キャンセル要求済み。実行中のリクエスト完了後に停止します。"; }
     private void Folder_Click(object s,RoutedEventArgs e) => Process.Start(new ProcessStartInfo(store.Root){UseShellExecute=true});
-    private IEnumerable<Mail> SelectedMail() => MailGrid.SelectedItems.OfType<MailRow>().Select(r=>r.Value).ToArray();
+    private IEnumerable<Mail> SelectedMail() => MailGrid.Items.OfType<MailRow>().Where(r=>r.IsChecked).Select(r=>r.Value).ToArray();
     private async void Register_Click(object s,RoutedEventArgs e)
     {
         var selected = SelectedMail().ToArray();
+        if(selected.Length==0) { MessageBox.Show("重要登録するメールをチェックしてください。"); return; }
         await Run(async ct =>
         {
             foreach(var mail in selected) await engine.ProtectAsync(mail,ct);
@@ -225,36 +266,123 @@ public partial class MainWindow : Window
         var mails=row.Value.Items.Where(i=>i.State=="失敗").Select(i=>i.Mail).ToArray();
         if(Confirm(mails,row.Value.Kind)) await Run(ct=>Execute(mails,row.Value.Kind,ct,row.Value.Label));
     }
+    private void UpdateCheckedCount()
+    {
+        if(TrashCheckedButton is not null) TrashCheckedButton.Content=$"チェックしたメールを削除 ({SelectedMail().Count():N0})";
+    }
+    private void MailCheck_Changed(object s,RoutedEventArgs e) => Dispatcher.BeginInvoke(new Action(UpdateCheckedCount));
+    private void CheckVisible_Click(object s,RoutedEventArgs e) { foreach(var row in MailGrid.Items.OfType<MailRow>()) row.IsChecked=true; UpdateCheckedCount(); }
+    private void UncheckVisible_Click(object s,RoutedEventArgs e) { foreach(var row in MailGrid.Items.OfType<MailRow>()) row.IsChecked=false; UpdateCheckedCount(); }
+    private void ClearMailFilter_Click(object s,RoutedEventArgs e)
+    { selectedSender=null; MailSearch.Text=""; SenderSearch.Text=""; Refresh(); }
+    private void AllSenders_Click(object s,RoutedEventArgs e) { selectedSender=null; Refresh(); }
+    private void SenderSearch_Changed(object s,TextChangedEventArgs e)
+    {
+        if(store is null || refreshing || SenderList is null) return;
+        var chosen=(AccountFilter.SelectedItem as Account)?.Id??"";
+        refreshing=true;
+        try
+        {
+            var choices=store.All<Mail>("mail").Where(m=>m.Eligible && (chosen=="" || m.AccountId==chosen))
+                .GroupBy(m=>m.Sender,StringComparer.Ordinal).Where(g=>Contains(g.Key,SenderSearch.Text))
+                .OrderByDescending(g=>g.Count()).Select(g=>new SenderChoice(g.Key,g.Count())).ToList();
+            SenderList.ItemsSource=choices;
+            SenderList.SelectedItem=choices.FirstOrDefault(x=>x.Address==selectedSender);
+        }
+        finally { refreshing=false; }
+    }
+    private void SenderList_Changed(object s,SelectionChangedEventArgs e)
+    {
+        if(refreshing) return;
+        if(SenderList.SelectedItem is SenderChoice choice) { selectedSender=choice.Address; Refresh(); }
+    }
+    private void ShowSenderMails_Click(object s,RoutedEventArgs e)
+    { selectedSender=SenderInput.Text.Trim(); Tabs.SelectedIndex=0; Refresh(); }
+    private async void MailGrid_SelectionChanged(object s,SelectionChangedEventArgs e)
+    {
+        if(refreshing || store is null) return;
+        previewRequest?.Cancel();
+        if(MailGrid.SelectedItem is not MailRow row) return;
+        var request=new CancellationTokenSource(); previewRequest=request;
+        previewContent=null; OpenPreviewButton.IsEnabled=false; PreviewAttachments.Children.Clear();
+        PreviewSubject.Text=row.件名;
+        PreviewMeta.Text=$"{row.送信元}\n{row.元アカウント} · {row.受信日時}";
+        PreviewBody.Text="本文を読み込んでいます…";
+        try
+        {
+            var saved=store.Get<Backup>("backup",row.Value.Key);
+            var content=saved is { State:"保存完了" } && File.Exists(saved.Path)
+                ? await MailEngine.ReadBackupAsync(saved)
+                : await MailEngine.ReadMessageAsync(await gateway.RawAsync(row.Value,request.Token),request.Token);
+            if(request.IsCancellationRequested || previewRequest!=request) return;
+            previewContent=content; PreviewBody.Text=content.Body; OpenPreviewButton.IsEnabled=true;
+            FillAttachments(PreviewAttachments,content.Attachments);
+        }
+        catch(OperationCanceledException) {}
+        catch(Exception ex) { if(previewRequest==request) PreviewBody.Text="本文を取得できませんでした。\n"+ex.Message; }
+        finally { if(previewRequest==request) previewRequest=null; request.Dispose(); }
+    }
+    private void FillAttachments(WrapPanel panel,List<(string Name,byte[] Data)> files)
+    {
+        panel.Children.Clear();
+        foreach(var file in files)
+        {
+            var button=new Button { Content="添付を保存: "+file.Name,MaxWidth=280 };
+            button.Click+=(_,_) =>
+            {
+                var picker=new SaveFileDialog { FileName=Path.GetFileName(file.Name),Filter="すべてのファイル|*.*" };
+                if(picker.ShowDialog()==true)
+                    try { File.WriteAllBytes(picker.FileName,file.Data); } catch(Exception ex) { MessageBox.Show(ex.Message); }
+            };
+            panel.Children.Add(button);
+        }
+    }
+    private void OpenPreview_Click(object s,RoutedEventArgs e)
+    {
+        if(previewContent is not {} content) return;
+        var panel=new DockPanel { Margin=new Thickness(20) };
+        var files=new WrapPanel(); FillAttachments(files,content.Attachments);
+        DockPanel.SetDock(files,Dock.Bottom); panel.Children.Add(files);
+        panel.Children.Add(new TextBox { Text=content.Body,IsReadOnly=true,TextWrapping=TextWrapping.Wrap,VerticalScrollBarVisibility=ScrollBarVisibility.Auto,FontSize=16 });
+        new Window { Owner=this,Title=PreviewSubject.Text,Width=900,Height=720,Content=panel }.Show();
+    }
     public async Task SmokeAsync(string folder)
     {
         store.Put("account","smoke-a",new Account("smoke-a","first@example.com","仕事用"));
         store.Put("account","smoke-b",new Account("smoke-b","second@example.com","仕事用"));
         var a=new Mail("smoke-a","1","sender@example.com","重要書類 — 保護済み",DateTimeOffset.Now,["INBOX"]);
         var b=new Mail("smoke-b","1","sender@example.com","アーカイブ済みメール",DateTimeOffset.Now,[]);
-        store.ReplaceMail(store.Get<Account>("account","smoke-a")!,[a]);
+        var other=new Mail("smoke-a","2","other@example.com","別の送信元のメール",DateTimeOffset.Now,["INBOX"]);
+        store.ReplaceMail(store.Get<Account>("account","smoke-a")!,[a,other]);
         store.ReplaceMail(store.Get<Account>("account","smoke-b")!,[b]);
         await engine.ProtectAsync(a);
-        Refresh();
-        Directory.CreateDirectory(folder);
+        var eml=System.Text.Encoding.UTF8.GetBytes("From: sender@example.com\r\nSubject: example\r\nContent-Type: text/plain; charset=utf-8\r\n\r\n本文のプレビューです。\r\n一覧を見ながら、ここで内容を確認できます。");
+        var path=Path.Combine(store.Root,"sample.eml"); await File.WriteAllBytesAsync(path,eml);
+        store.Put("backup",a.Key,new Backup(a,true,"保存完了",path,null));
+        Refresh(); Directory.CreateDirectory(folder);
+        if(MailGrid.Items.Count!=3) throw new InvalidOperationException("初期件数が不正");
+        SenderList.SelectedItem=SenderList.Items.OfType<SenderChoice>().Single(x=>x.Address=="sender@example.com");
+        if(MailGrid.Items.Count!=2) throw new InvalidOperationException("送信元完全一致の絞り込みが不正");
+        CheckVisible_Click(this,new());
+        if(SelectedMail().Count()!=2 || SelectedMail().Any(m=>m.Sender!="sender@example.com")) throw new InvalidOperationException("チェック対象が絞り込み外へ広がっています");
+        if(MailGrid.Items.OfType<MailRow>().Any(r=>r.元アカウント.Contains('@'))) throw new InvalidOperationException("元アカウントのアドレスが表示されています");
+        MailGrid.SelectedItem=MailGrid.Items.OfType<MailRow>().Single(r=>r.Value.Key==a.Key);
+        for(int i=0;i<30 && previewContent is null;i++) await Task.Delay(20);
+        if(previewContent is null || !PreviewBody.Text.Contains("本文のプレビュー")) throw new InvalidOperationException("本文プレビューが不正");
         foreach(TabItem tab in Tabs.Items)
         {
-            Tabs.SelectedItem=tab;
-            UpdateLayout();
+            Tabs.SelectedItem=tab; UpdateLayout();
             await Dispatcher.InvokeAsync(()=>{},System.Windows.Threading.DispatcherPriority.ApplicationIdle);
+            if(Tabs.SelectedIndex==0) { selectedSender="sender@example.com"; Refresh(); MailGrid.SelectedItem=MailGrid.Items.OfType<MailRow>().Single(r=>r.Value.Key==a.Key); for(int i=0;i<30 && previewContent is null;i++) await Task.Delay(20); }
+            UpdateLayout();
             var bitmap=new System.Windows.Media.Imaging.RenderTargetBitmap((int)ActualWidth,(int)ActualHeight,96,96,System.Windows.Media.PixelFormats.Pbgra32);
             bitmap.Render(this);
-            var png=new System.Windows.Media.Imaging.PngBitmapEncoder();
-            png.Frames.Add(System.Windows.Media.Imaging.BitmapFrame.Create(bitmap));
-            using var file=File.Create(Path.Combine(folder,$"tab-{Tabs.SelectedIndex}.png"));
-            png.Save(file);
+            var png=new System.Windows.Media.Imaging.PngBitmapEncoder(); png.Frames.Add(System.Windows.Media.Imaging.BitmapFrame.Create(bitmap));
+            using var file=File.Create(Path.Combine(folder,$"tab-{Tabs.SelectedIndex}.png")); png.Save(file);
         }
-        if(MailGrid.Items.Count!=2 || SenderGrid.Items.Count!=1 || VaultGrid.Items.Count!=1 || AccountsGrid.Items.Count!=2)
-            throw new InvalidOperationException("UIの統合件数が不正です");
-        if(MailGrid.Columns.Any(c=>c.Header?.ToString()=="Value")) throw new InvalidOperationException("内部値の列が表示されています");
         VaultSender.Text="no-match";
-        if(VaultGrid.Items.Count!=0) throw new InvalidOperationException("保管庫検索が不正です");
-        VaultSender.Text="";
-        File.WriteAllText(Path.Combine(folder,"result.txt"),"PASS: 6 tabs rendered; duplicate accounts; combined mail counts; vault filter; internal columns hidden.");
+        if(VaultGrid.Items.Count!=0) throw new InvalidOperationException("保管庫検索が不正");
+        File.WriteAllText(Path.Combine(folder,"result.txt"),"PASS: 6 tabs; exact sender filter; checked items scoped to visible mail; account email hidden; saved body preview; vault search.");
     }
     private void Filter_Changed(object s,TextChangedEventArgs e) => Refresh();
     private void AccountFilter_Changed(object s,SelectionChangedEventArgs e) { if(!refreshing) Refresh(); }

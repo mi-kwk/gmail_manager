@@ -138,8 +138,12 @@ public sealed class MailEngine(Store store, IMailGateway gateway)
     public static async Task<(string Body, List<(string Name, byte[] Data)> Attachments)> ReadBackupAsync(Backup backup)
     {
         if(backup.State != "保存完了" || backup.Path is null) throw new InvalidOperationException("バックアップ未完了です");
-        using var stream = File.OpenRead(backup.Path);
-        using var mime = await MimeMessage.LoadAsync(stream);
+        return await ReadMessageAsync(await File.ReadAllBytesAsync(backup.Path));
+    }
+    public static async Task<(string Body, List<(string Name, byte[] Data)> Attachments)> ReadMessageAsync(byte[] raw, CancellationToken ct = default)
+    {
+        using var stream = new MemoryStream(raw);
+        using var mime = await MimeMessage.LoadAsync(stream,ct);
         var files = new List<(string, byte[])>();
         foreach(var part in mime.BodyParts)
         {
