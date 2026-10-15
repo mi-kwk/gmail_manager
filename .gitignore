@@ -1,0 +1,9 @@
+bin/
+obj/
+.vs/
+artifacts/
+client_secret*.json
+credentials*.json
+*.user
+*.db*
+*.eml
