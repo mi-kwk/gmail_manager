@@ -74,12 +74,14 @@ public sealed class MailEngine(Store store, IMailGateway gateway)
     public async Task<Operation> ExecuteAsync(IEnumerable<Mail> mails, string action, string? label,
         IProgress<ProgressInfo>? progress, CancellationToken ct)
     {
-        if(!await operationLock.WaitAsync(0)) throw new InvalidOperationException("別の操作が実行中です");
+
         var op = new Operation(Guid.NewGuid().ToString("N"), DateTimeOffset.Now, action,
             mails.DistinctBy(m => m.Key).Select(m => new OperationItem(m, "未処理")).ToList(), label);
+        if(!await operationLock.WaitAsync(0)) throw new InvalidOperationException("別の操作が実行中です");
         try
         {
             store.Put("operation", op.Id, op);
+            int completed=0;
             foreach(var batch in Enumerable.Range(0, op.Items.Count).Chunk(50))
             {
                 foreach(var index in batch)
@@ -97,7 +99,7 @@ public sealed class MailEngine(Store store, IMailGateway gateway)
                             op.Items[index] = item with { State = "対象外" };
                         else
                         {
-                            op.Items[index] = item with { State = "実行中" }; store.Put("operation", op.Id, op);
+                            op.Items[index] = item with { State = "実行中" }; store.SaveOperationItem(op,index);
                             // Cancel stops unsent work. An already submitted request is allowed to finish.
                             await gateway.ChangeAsync(item.Mail, action, label, CancellationToken.None);
                             op.Items[index] = item with { State = "成功" };
@@ -114,8 +116,8 @@ public sealed class MailEngine(Store store, IMailGateway gateway)
                     }
                     catch(Exception ex) { op.Items[index] = item with { State = "失敗", Error = ex.Message }; }
                     finally { gate.Release(); }
-                    store.Put("operation", op.Id, op);
-                    progress?.Report(new(op.Items.Count(i => i.State != "未処理"), op.Items.Count, "分割処理中"));
+                    store.SaveOperationItem(op,index);
+                    progress?.Report(new(++completed, op.Items.Count, "分割処理中"));
                 }
                 if(ct.IsCancellationRequested) break;
                 await Task.Yield();

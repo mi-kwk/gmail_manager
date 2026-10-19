@@ -71,6 +71,7 @@ Check(liveContent.Body.Contains("offline body") && liveContent.Attachments.Count
 var htmlContent=await MailEngine.ReadMessageAsync(Encoding.UTF8.GetBytes("From: sender@example.com\r\nContent-Type: text/html; charset=utf-8\r\n\r\n<p>Preview &amp; body</p><script>hidden_script()</script>"));
 Check(htmlContent.Body.Contains("Preview & body") && !htmlContent.Body.Contains("hidden_script"),"HTML preview is decoded as inert text without scripts");
 Console.WriteLine($"{checks} checks passed. Test data: {root}");
+await LoadChecks.RunAsync();
 
 sealed class FakeGateway : IMailGateway
 {

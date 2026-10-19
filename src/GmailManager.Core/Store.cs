@@ -18,6 +18,7 @@ public sealed class Store
         cmd.CommandText = """
             PRAGMA journal_mode=WAL;
             CREATE TABLE IF NOT EXISTS records(kind TEXT NOT NULL, id TEXT NOT NULL, json TEXT NOT NULL, PRIMARY KEY(kind,id));
+            CREATE TABLE IF NOT EXISTS operation_items(operation_id TEXT NOT NULL, position INTEGER NOT NULL, json TEXT NOT NULL, PRIMARY KEY(operation_id,position));
             """;
         cmd.ExecuteNonQuery();
         // An interrupted backup remains protected and becomes retryable.
@@ -37,13 +38,49 @@ public sealed class Store
         lock(sync)
         {
             using var db = Open();
-            using var cmd = db.CreateCommand();
+            using var tx = db.BeginTransaction();
+            using var cmd = db.CreateCommand(); cmd.Transaction=tx;
             cmd.CommandText = "INSERT INTO records(kind,id,json) VALUES($k,$i,$j) ON CONFLICT(kind,id) DO UPDATE SET json=excluded.json";
             cmd.Parameters.AddWithValue("$k", kind);
             cmd.Parameters.AddWithValue("$i", id);
             cmd.Parameters.AddWithValue("$j", JsonSerializer.Serialize(value));
             cmd.ExecuteNonQuery();
+            if(kind=="operation")
+            {
+                using var clear=db.CreateCommand(); clear.Transaction=tx;
+                clear.CommandText="DELETE FROM operation_items WHERE operation_id=$id";
+                clear.Parameters.AddWithValue("$id",id); clear.ExecuteNonQuery();
+            }
+            tx.Commit();
         }
+    }
+    public void SaveOperationItem(Operation operation,int position)
+    {
+        lock(sync)
+        {
+            using var db=Open();
+            using var cmd=db.CreateCommand();
+            cmd.CommandText="INSERT INTO operation_items(operation_id,position,json) VALUES($id,$p,$j) ON CONFLICT(operation_id,position) DO UPDATE SET json=excluded.json";
+            cmd.Parameters.AddWithValue("$id",operation.Id);
+            cmd.Parameters.AddWithValue("$p",position);
+            cmd.Parameters.AddWithValue("$j",JsonSerializer.Serialize(operation.Items[position]));
+            cmd.ExecuteNonQuery();
+        }
+    }
+    private static T Hydrate<T>(SqliteConnection db,T value)
+    {
+        if(value is not Operation operation) return value;
+        using var cmd=db.CreateCommand();
+        cmd.CommandText="SELECT position,json FROM operation_items WHERE operation_id=$id ORDER BY position";
+        cmd.Parameters.AddWithValue("$id",operation.Id);
+        using var reader=cmd.ExecuteReader();
+        while(reader.Read())
+        {
+            int position=reader.GetInt32(0);
+            if(position<0 || position>=operation.Items.Count) throw new InvalidDataException("操作履歴の位置が不正です");
+            operation.Items[position]=JsonSerializer.Deserialize<OperationItem>(reader.GetString(1))!;
+        }
+        return value;
     }
     public T? Get<T>(string kind, string id)
     {
@@ -53,7 +90,7 @@ public sealed class Store
             using var cmd = db.CreateCommand();
             cmd.CommandText = "SELECT json FROM records WHERE kind=$k AND id=$i";
             cmd.Parameters.AddWithValue("$k", kind); cmd.Parameters.AddWithValue("$i", id);
-            return cmd.ExecuteScalar() is string json ? JsonSerializer.Deserialize<T>(json) : default;
+            return cmd.ExecuteScalar() is string json ? Hydrate(db,JsonSerializer.Deserialize<T>(json)!) : default;
         }
     }
     public List<T> All<T>(string kind)
@@ -67,7 +104,8 @@ public sealed class Store
             using var reader = cmd.ExecuteReader();
             var list = new List<T>();
             while(reader.Read()) list.Add(JsonSerializer.Deserialize<T>(reader.GetString(0))!);
-            return list;
+            reader.Close();
+            return list.Select(value=>Hydrate(db,value)).ToList();
         }
     }
     public void ReplaceMail(Account account, IReadOnlyList<Mail> mails)
